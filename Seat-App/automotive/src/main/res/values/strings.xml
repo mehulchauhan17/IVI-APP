@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">car</string>
+    <string name="button">Button</string>
+    <string name="Features" />
+    <string name="mercedes_benz">Mahindra</string>
+    <string name="experience_the_life_of_comfort">~Experience the life of comfort</string>
+    <string name="seat">Seat</string>
+    <string name="gttn"><![CDATA[>]]></string>
+    <string name="window">Window</string>
+    <string name="light">Light</string>
+    <string name="hvac">HVAC</string>
+    <string name="adas">ADAS</string>
+    <string name="seat_adj">Seat Adjust</string>
+    <string name="seat_heat">Seat Heat</string>
+    <string name="seat_massage">Seat Massage\n</string>
+    <string name="seat_front">Front</string>
+    <string name="seat_rear">Rear\n</string>
+    <string name="minus">-</string>
+    <string name="plus">+\n</string>
+    <string name="response_will_be_shown_here">Response will be shown here</string>
+</resources>
