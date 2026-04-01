@@ -24,9 +24,13 @@ public class MainActivity extends Activity {
 
     Spinner leftseatdropdown;
     Spinner rightseatdropdown;
-    boolean frontselected;
+    boolean frontselected = true;
 
-    // --- STATE CACHE: Remembers seat temperatures instantly ---
+    // --- BULLETPROOF LOGIC FLAGS ---
+    boolean isUpdatingUI = false; // Blocks the "Spinner Loop of Death"
+    boolean isSystemOn = false;   // Tracks power state accurately
+
+    // --- STATE CACHE ---
     int frontLeftTemp = 0;
     int frontRightTemp = 0;
     int rearLeftTemp = 0;
@@ -75,8 +79,11 @@ public class MainActivity extends Activity {
         changeactivationBtnclr.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                Drawable btnBackground = changeactivationBtnclr.getBackground();
-                if (btnBackground.getConstantState() == (getResources().getDrawable(R.drawable.vector_onoff).getConstantState())) {
+                if (isUpdatingUI) return; // Block physical clicks if AI is controlling
+
+                if (!isSystemOn) {
+                    // Turn System ON
+                    isSystemOn = true;
                     frontselected = true;
                     changeactivationBtnclr.setBackgroundResource(R.drawable.vector_on);
                     seatheatfeatureselection.setImageResource(R.drawable.linetomarkselectedseatregion);
@@ -86,19 +93,24 @@ public class MainActivity extends Activity {
                     rearzonebtn.setEnabled(true);
                     leftseatdropdown.setEnabled(true);
                     rightseatdropdown.setEnabled(true);
+
+                    isUpdatingUI = true;
                     leftseatdropdown.setSelection(0);
                     rightseatdropdown.setSelection(0);
+                    isUpdatingUI = false;
+
                     seatright.setImageResource(R.drawable.frontseat_rightplus1temp);
                     seatleft.setImageResource(R.drawable.frontseat_leftplus1temp);
                     leftseatdropdownicon.setImageResource(R.drawable.vector_dropdown);
                     rightseatdropdownicon.setImageResource(R.drawable.vector_dropdown);
 
-                    // Reset cache to +1 on power up
                     frontLeftTemp = 1; frontRightTemp = 1;
                     rearLeftTemp = 1; rearRightTemp = 1;
 
                     sendMessage("activate_seat_heat-->front");
-                } else if (btnBackground.getConstantState() == (getResources().getDrawable(R.drawable.vector_on).getConstantState())) {
+                } else {
+                    // Turn System OFF
+                    isSystemOn = false;
                     changeactivationBtnclr.setBackgroundResource(R.drawable.vector_onoff);
                     frontzonebtn.setEnabled(false);
                     rearzonebtn.setEnabled(false);
@@ -111,7 +123,6 @@ public class MainActivity extends Activity {
                     leftseatdropdownicon.setImageResource(R.drawable.offstatedropdownicon);
                     rightseatdropdownicon.setImageResource(R.drawable.offstatedropdownicon);
 
-                    // Clear cache on power down
                     frontLeftTemp = 0; frontRightTemp = 0;
                     rearLeftTemp = 0; rearRightTemp = 0;
 
@@ -120,35 +131,31 @@ public class MainActivity extends Activity {
             }
         });
 
-        // --- REAR ZONE BUTTON (Instant Cache Load) ---
+        // --- REAR ZONE BUTTON ---
         rearzonebtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 frontselected = false;
-
                 rearzoneselection.setImageResource(R.drawable.linetomarkselectedregion);
                 frontzoneselection.setImageDrawable(null);
                 seatright.setImageResource(R.drawable.rear_rightseat);
                 seatleft.setImageResource(R.drawable.rear_leftseat);
 
-                // Restore from Cache!
                 if (rearLeftTemp != 0) updateUIBasedOnTemperature("rear-->1-->" + rearLeftTemp);
                 if (rearRightTemp != 0) updateUIBasedOnTemperature("rear-->2-->" + rearRightTemp);
             }
         });
 
-        // --- FRONT ZONE BUTTON (Instant Cache Load) ---
+        // --- FRONT ZONE BUTTON ---
         frontzonebtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 frontselected = true;
-
                 frontzoneselection.setImageResource(R.drawable.linetomarkselectedregion);
                 rearzoneselection.setImageDrawable(null);
                 seatright.setImageResource(R.drawable.img_right);
                 seatleft.setImageResource(R.drawable.img_left);
 
-                // Restore from Cache!
                 if (frontLeftTemp != 0) updateUIBasedOnTemperature("front-->1-->" + frontLeftTemp);
                 if (frontRightTemp != 0) updateUIBasedOnTemperature("front-->2-->" + frontRightTemp);
             }
@@ -158,14 +165,12 @@ public class MainActivity extends Activity {
         leftseatdropdown.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (isUpdatingUI) return;
                 String selectedTemp = parent.getItemAtPosition(position).toString();
                 String zone = frontselected ? "front" : "rear";
-                String command = "update_seat_temperature-->" + zone + "-->1-->" + selectedTemp;
-
-                sendMessage(command);
+                sendMessage(zone + "-->1-->" + selectedTemp);
                 updateUIBasedOnTemperature(zone + "-->1-->" + selectedTemp.replace("+", ""));
             }
-
             @Override
             public void onNothingSelected(AdapterView<?> parent) {}
         });
@@ -174,175 +179,119 @@ public class MainActivity extends Activity {
         rightseatdropdown.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (isUpdatingUI) return;
                 String selectedTemp = parent.getItemAtPosition(position).toString();
                 String zone = frontselected ? "front" : "rear";
-                String command = "update_seat_temperature-->" + zone + "-->2-->" + selectedTemp;
-
-                sendMessage(command);
+                sendMessage(zone + "-->2-->" + selectedTemp);
                 updateUIBasedOnTemperature(zone + "-->2-->" + selectedTemp.replace("+", ""));
             }
-
             @Override
             public void onNothingSelected(AdapterView<?> parent) {}
         });
 
-        // 🚀 START THE BACKGROUND VOICE LISTENER
         startPersistentListener();
     }
 
-    // --- 📡 THE NEW PERSISTENT BACKGROUND LISTENER ---
+    // --- PERSISTENT BACKGROUND LISTENER ---
     private void startPersistentListener() {
         new Thread(() -> {
-            while (true) { // Auto-reconnect loop
-                // NOTE: 10.0.2.2 is the special Android Emulator IP that routes to your PC
+            while (true) {
                 try (Socket socket = new Socket("10.0.2.2", 12345);
                      BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
 
-                    Log.d("VoiceAI", "Listening for Python ASR Commands on 10.0.2.2...");
+                    Log.d("VoiceAI", "Listening for Python ASR Commands...");
                     String incomingData;
 
-                    // Runs forever as long as the server sends data
                     while ((incomingData = bufferedReader.readLine()) != null) {
                         Log.d("VoiceAI", "Received from Server: " + incomingData);
-
                         final String finalData = incomingData;
 
-                        // Jump back to the main UI thread to update images
                         runOnUiThread(() -> {
                             textViewResponse.setText("Voice Command Executed!");
                             updateUIBasedOnTemperature(finalData);
                         });
                     }
                 } catch (Exception e) {
-                    Log.e("VoiceAI", "Server connection lost. Retrying in 3 seconds...", e);
                     try { Thread.sleep(3000); } catch (InterruptedException ie) { ie.printStackTrace(); }
                 }
             }
         }).start();
     }
 
-    // --- 🚀 THE SIMPLIFIED NETWORK SENDER ---
     public void sendMessage(final String message) {
         new Thread(() -> {
-            // NOTE: 10.0.2.2 is the special Android Emulator IP that routes to your PC
             try (Socket socket = new Socket("10.0.2.2", 12345);
                  OutputStreamWriter outputStreamWriter = new OutputStreamWriter(socket.getOutputStream())) {
-
-                // Just send the UI button click and close. The Listener thread catches the reply!
                 outputStreamWriter.write(message + "\n");
                 outputStreamWriter.flush();
-                Log.d("VoiceAI", "App Sent: " + message);
-
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }).start();
     }
 
-    // --- 🧠 MASTER UI & CACHE UPDATER ---
+    // --- MASTER UI & CACHE UPDATER ---
     private void updateUIBasedOnTemperature(String temp) {
+        isUpdatingUI = true; // LOCK THE UI
+
         try {
-            // 1. Handle Power OFF via Voice
             if (temp.equals("deactivate_seat_heat")) {
-                Drawable btnBackground = changeactivationBtnclr.getBackground();
-                // If it is currently ON, virtually click it to turn it OFF
-                if (btnBackground.getConstantState() == (getResources().getDrawable(R.drawable.vector_on).getConstantState())) {
-                    changeactivationBtnclr.performClick();
-                }
+                if (isSystemOn) changeactivationBtnclr.performClick();
                 return;
             }
 
-            // 2. Handle Power ON via Voice
             if (temp.startsWith("activate_seat_heat")) {
-                Drawable btnBackground = changeactivationBtnclr.getBackground();
-                // If it is currently OFF, virtually click it to turn it ON
-                if (btnBackground.getConstantState() == (getResources().getDrawable(R.drawable.vector_onoff).getConstantState())) {
-                    changeactivationBtnclr.performClick();
-                }
+                if (!isSystemOn) changeactivationBtnclr.performClick();
                 return;
             }
 
-            // 3. Handle specific temperature changes
+            // SAFETY SCRUBBER: If Python accidentally sends the 4-part string, fix it!
+            if (temp.startsWith("update_seat_temperature-->")) {
+                temp = temp.replace("update_seat_temperature-->", "");
+            }
+
             String[] parts = temp.split("-->");
-            if (parts.length != 3) return;
+            if (parts.length != 3) {
+                Log.e("VoiceAI", "Ignored malformed command: " + temp);
+                return;
+            }
 
             String zone = parts[0].trim();
             int seatId = Integer.parseInt(parts[1].trim());
             int temperature = Integer.parseInt(parts[2].replace("+", "").trim());
 
-            // Auto-turn ON the system if the user asks for a specific temperature while the power is off
-            Drawable btnBackground = changeactivationBtnclr.getBackground();
-            if (btnBackground.getConstantState() == (getResources().getDrawable(R.drawable.vector_onoff).getConstantState())) {
-                changeactivationBtnclr.performClick();
-            }
+            if (!isSystemOn) changeactivationBtnclr.performClick();
 
-            // 4. UPDATE THE MEMORY CACHE
             if (zone.equals("front") && seatId == 1) frontLeftTemp = temperature;
             if (zone.equals("front") && seatId == 2) frontRightTemp = temperature;
             if (zone.equals("rear") && seatId == 1) rearLeftTemp = temperature;
             if (zone.equals("rear") && seatId == 2) rearRightTemp = temperature;
 
-            // 5. ONLY UPDATE UI IF WE ARE LOOKING AT THE CORRECT ZONE
             if ((zone.equals("front") && frontselected) || (zone.equals("rear") && !frontselected)) {
-
-                if (seatId == 1) { // LEFT SEAT
+                if (seatId == 1) {
                     switch (temperature) {
-                        case 1:
-                            leftseatdropdown.setSelection(0);
-                            seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftplus1temp : R.drawable.rearseat_leftplus1temp);
-                            break;
-                        case 2:
-                            leftseatdropdown.setSelection(1);
-                            seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftplus2temp : R.drawable.rearseat_leftplus2temp);
-                            break;
-                        case 3:
-                            leftseatdropdown.setSelection(2);
-                            seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftplus3temp : R.drawable.rearseat_leftplus3temp);
-                            break;
-                        case -1:
-                            leftseatdropdown.setSelection(3);
-                            seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftminus1temp : R.drawable.rearseat_leftminus1temp);
-                            break;
-                        case -2:
-                            leftseatdropdown.setSelection(4);
-                            seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftminus2temp : R.drawable.rearseat_leftminus2temp);
-                            break;
-                        case -3:
-                            leftseatdropdown.setSelection(5);
-                            seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftminus3temp : R.drawable.rearseat_leftminus3temp);
-                            break;
+                        case 1: leftseatdropdown.setSelection(0); seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftplus1temp : R.drawable.rearseat_leftplus1temp); break;
+                        case 2: leftseatdropdown.setSelection(1); seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftplus2temp : R.drawable.rearseat_leftplus2temp); break;
+                        case 3: leftseatdropdown.setSelection(2); seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftplus3temp : R.drawable.rearseat_leftplus3temp); break;
+                        case -1: leftseatdropdown.setSelection(3); seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftminus1temp : R.drawable.rearseat_leftminus1temp); break;
+                        case -2: leftseatdropdown.setSelection(4); seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftminus2temp : R.drawable.rearseat_leftminus2temp); break;
+                        case -3: leftseatdropdown.setSelection(5); seatleft.setImageResource(frontselected ? R.drawable.frontseat_leftminus3temp : R.drawable.rearseat_leftminus3temp); break;
                     }
-                } else if (seatId == 2) { // RIGHT SEAT
+                } else if (seatId == 2) {
                     switch (temperature) {
-                        case 1:
-                            rightseatdropdown.setSelection(0);
-                            seatright.setImageResource(frontselected ? R.drawable.frontseat_rightplus1temp : R.drawable.rearseat_rightplus1temp);
-                            break;
-                        case 2:
-                            rightseatdropdown.setSelection(1);
-                            seatright.setImageResource(frontselected ? R.drawable.frontseat_rightplus2temp : R.drawable.rearseat_rightplus2temp);
-                            break;
-                        case 3:
-                            rightseatdropdown.setSelection(2);
-                            seatright.setImageResource(frontselected ? R.drawable.frontseat_rightplus3temp : R.drawable.rearseat_rightplus3temp);
-                            break;
-                        case -1:
-                            rightseatdropdown.setSelection(3);
-                            seatright.setImageResource(frontselected ? R.drawable.frontseat_rightminus1temp : R.drawable.rearseat_rightminus1temp);
-                            break;
-                        case -2:
-                            rightseatdropdown.setSelection(4);
-                            seatright.setImageResource(frontselected ? R.drawable.frontseat_rightminus2temp : R.drawable.rearseat_rightminus2temp);
-                            break;
-                        case -3:
-                            rightseatdropdown.setSelection(5);
-                            seatright.setImageResource(frontselected ? R.drawable.frontseat_rightminus3temp : R.drawable.rearseat_rightminus3temp);
-                            break;
+                        case 1: rightseatdropdown.setSelection(0); seatright.setImageResource(frontselected ? R.drawable.frontseat_rightplus1temp : R.drawable.rearseat_rightplus1temp); break;
+                        case 2: rightseatdropdown.setSelection(1); seatright.setImageResource(frontselected ? R.drawable.frontseat_rightplus2temp : R.drawable.rearseat_rightplus2temp); break;
+                        case 3: rightseatdropdown.setSelection(2); seatright.setImageResource(frontselected ? R.drawable.frontseat_rightplus3temp : R.drawable.rearseat_rightplus3temp); break;
+                        case -1: rightseatdropdown.setSelection(3); seatright.setImageResource(frontselected ? R.drawable.frontseat_rightminus1temp : R.drawable.rearseat_rightminus1temp); break;
+                        case -2: rightseatdropdown.setSelection(4); seatright.setImageResource(frontselected ? R.drawable.frontseat_rightminus2temp : R.drawable.rearseat_rightminus2temp); break;
+                        case -3: rightseatdropdown.setSelection(5); seatright.setImageResource(frontselected ? R.drawable.frontseat_rightminus3temp : R.drawable.rearseat_rightminus3temp); break;
                     }
                 }
             }
         } catch (Exception e) {
-            Log.e("UIUpdater", "Error parsing temperature string: " + temp);
+            Log.e("UIUpdater", "Error parsing string: " + temp, e);
+        } finally {
+            isUpdatingUI = false; // UNLOCK THE UI
         }
     }
 }

@@ -7,28 +7,27 @@ import sys
 import time
 import speech_recognition as sr
 import scipy.io.wavfile as wav
-import google.generativeai as genai
 import json
 import os
 import socket
 import threading
+import requests
 
 warnings.filterwarnings("ignore")
 
 # --- 1. CONFIGURATION ---
-WAKE_WORD_MODEL = "hey_visteon.onnx" # Use "../hey_visteon.onnx" if it's one folder up
-GEMINI_API_KEY = "AIzaSyCsh_s5eBN-pAQgxXcfyFrobcAKp7UGotI" # <-- PASTE YOUR KEY HERE
+WAKE_WORD_MODEL = "hey_visteon.onnx" 
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.25
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)
+OLLAMA_MODEL = "qwen2.5:0.5b" # Make sure Ollama is running this exact model!
 
 # --- 2. THE BUILT-IN TCP SERVER ---
-connected_clients = [] # Stores active Android app connections
+connected_clients = [] 
 
 def start_tcp_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # 0.0.0.0 means it will accept connections on your machine's IP address (10.118.253.54)
-    server.bind(('10.118.253.54', 12345)) 
+    server.bind(('0.0.0.0', 12345)) 
     server.listen(5)
     print("📡 Built-in TCP Server running! Waiting for Android App to connect...")
     
@@ -40,7 +39,6 @@ def start_tcp_server():
         except Exception as e:
             print(f"Server error: {e}")
 
-# Start the server in a background thread so it doesn't block the microphone
 server_thread = threading.Thread(target=start_tcp_server, daemon=True)
 server_thread.start()
 
@@ -48,20 +46,31 @@ server_thread.start()
 print("Booting AI Subsystems...")
 ort_session = ort.InferenceSession(WAKE_WORD_MODEL)
 
-genai.configure(api_key=GEMINI_API_KEY)
+# FEW-SHOT PROMPTING: We give Qwen exact examples so it never forgets the format
 system_instruction = """
 You are the voice assistant for an In-Vehicle Infotainment system. 
-Your ONLY job is to map passenger seat heating/ventilation requests to our strict JSON schema.
-Valid Actions: "activate_seat_heat", "deactivate_seat_heat", "get_seat_temperature", "update_seat_temperature"
-Valid Variables:
-- zone: "front" or "rear"
-- seat_id: "1" (Left) or "2" (Right)
-- temperature: "+1", "+2", "+3" OR "-1", "-2", "-3"
+Map passenger seat climate requests to our strict JSON schema.
 
-If a request targets ONE seat, output a single JSON object: {"action": "...", "zone": "...", "seat_id": "...", "temperature": "...", "tts_response": "..."}
-If a request targets MULTIPLE seats (like "all seats"), output a JSON array of objects: [{"action": "..."}, {"action": "..."}]
+Valid Actions: "activate_seat_heat", "deactivate_seat_heat", "update_seat_temperature"
+Valid Variables: zone ("front" or "rear"), seat_id ("1" for Left, "2" for Right), temperature ("+1", "+2", "+3", "-1", "-2", "-3")
+
+EXAMPLES:
+User: "Turn off all the seats"
+Output: [{"action": "deactivate_seat_heat", "tts_response": "Shutting down seat climate."}]
+
+User: "Turn on cooling for the driver"
+Output: [{"action": "update_seat_temperature", "zone": "front", "seat_id": "1", "temperature": "-3", "tts_response": "Cooling the driver seat."}]
+
+User: "Turn on heat for all seats"
+Output: [
+  {"action": "update_seat_temperature", "zone": "front", "seat_id": "1", "temperature": "+3"},
+  {"action": "update_seat_temperature", "zone": "front", "seat_id": "2", "temperature": "+3"},
+  {"action": "update_seat_temperature", "zone": "rear", "seat_id": "1", "temperature": "+3"},
+  {"action": "update_seat_temperature", "zone": "rear", "seat_id": "2", "temperature": "+3", "tts_response": "Heating all seats."}
+]
+
+CRITICAL RULE: Output ONLY valid JSON. NEVER invent new actions or zones.
 """
-llm_model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=system_instruction, generation_config={"response_mime_type": "application/json"})
 
 recognizer = sr.Recognizer()
 
@@ -92,13 +101,55 @@ def transcribe_command():
             os.remove("temp_command.wav")
 
 def get_intent_from_llm(text):
-    print("🧠 Analyzing intent...")
+    print(f"🧠 Analyzing intent via Local Ollama ({OLLAMA_MODEL})...")
+    
+    # USING THE CHAT ENDPOINT INSTEAD OF GENERATE
+    url = "http://localhost:11434/api/chat"
+    
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": text}
+        ],
+        "stream": False
+    }
     
     try:
-        response = llm_model.generate_content(text)
-        intent_data_raw = json.loads(response.text)
+        # We added timeout=15 so it doesn't freeze your app forever!
+        response = requests.post(url, json=payload, timeout=15) 
+        response.raise_for_status()
         
-        # 1. Normalize the data: if it's a single dict, turn it into a list of one item
+        result = response.json()
+        
+        # In the chat endpoint, the text lives inside message -> content
+        raw_text = result.get("message", {}).get("content", "").strip()
+        print(f"🔍 DEBUG - Raw LLM Output:\n{raw_text}\n") 
+        
+        # --- THE ULTIMATE JSON EXTRACTOR ---
+        start_idx_dict = raw_text.find('{')
+        start_idx_list = raw_text.find('[')
+        
+        start_idx = -1
+        if start_idx_dict != -1 and start_idx_list != -1:
+            start_idx = min(start_idx_dict, start_idx_list)
+        else:
+            start_idx = max(start_idx_dict, start_idx_list)
+            
+        end_idx_dict = raw_text.rfind('}')
+        end_idx_list = raw_text.rfind(']')
+        
+        end_idx = max(end_idx_dict, end_idx_list)
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            raw_text = raw_text[start_idx:end_idx+1]
+        else:
+            raw_text = "{}" # Fallback
+        # -------------------------------------
+            
+        intent_data_raw = json.loads(raw_text)
+        
+        # Normalize the data: if it's a single dict, turn it into a list
         if isinstance(intent_data_raw, dict):
             intent_list = [intent_data_raw]
         elif isinstance(intent_data_raw, list):
@@ -106,30 +157,33 @@ def get_intent_from_llm(text):
         else:
             return
 
-        # 2. Loop through every command the AI generated
+        # Loop through every command the AI generated
         for intent_data in intent_list:
             action = intent_data.get("action")
-            zone = intent_data.get("zone")
-            seat_id = intent_data.get("seat_id")
-            temp = intent_data.get("temperature")
-            tts = intent_data.get("tts_response")
+            zone = intent_data.get("zone", "front") # Default to front if hallucinated
+            seat_id = intent_data.get("seat_id", "1") # Default to 1 if hallucinated
+            temp = intent_data.get("temperature", "+1")
+            tts = intent_data.get("tts_response", "")
             
-            if not action or str(action).lower() in ["none", "null"]:
-                print(f"🗣️ AI Voice Response: {tts}")
+            # --- THE BOUNCER: Reject fake actions ---
+            valid_actions = ["activate_seat_heat", "deactivate_seat_heat", "update_seat_temperature"]
+            if action not in valid_actions:
+                print(f"🛑 Blocked Hallucinated Action from AI: {action}")
                 continue
+            # ----------------------------------------
                 
             if action == "deactivate_seat_heat":
                 command = "deactivate_seat_heat"
             elif action == "activate_seat_heat":
                 command = "activate_seat_heat-->front"
             else:
-                command = f"{action}-->{zone}-->{seat_id}-->{temp}"
+                command = f"{zone}-->{seat_id}-->{temp}"
+              #  command = f"{action}-->{zone}-->{seat_id}-->{temp}"
                 
-            # Only print the TTS response once if it's the first item in the list
-            if intent_data == intent_list[0]:
+            if intent_data == intent_list[0] and tts:
                 print(f"🗣️ AI Voice Response: {tts}")
             
-            # 3. SEND TO ANDROID APP DIRECTLY
+            # SEND TO ANDROID APP DIRECTLY
             if not connected_clients:
                 print("⏳ Command generated, but the Android app is not connected yet!")
             else:
@@ -144,11 +198,14 @@ def get_intent_from_llm(text):
                 for dead in dead_connections:
                     connected_clients.remove(dead)
             
-            # Add a tiny 0.1s delay so the Android app doesn't choke on multiple commands at once
             time.sleep(0.1)
 
+    except requests.exceptions.ConnectionError:
+        print("⚠️ Error: Could not connect to Ollama. Is the Ollama app running?")
+    except json.JSONDecodeError:
+        print(f"⚠️ JSON Parsing Error. Extracted text was: {raw_text}")
     except Exception as e:
-        print("⚠️ Error parsing LLM output or sending to Android.", e)
+        print(f"⚠️ Error parsing Ollama output: {e}")
         
 # --- 5. MAIN WAKE WORD LOOP ---
 audio_buffer = np.zeros(SAMPLE_RATE, dtype=np.float32)
